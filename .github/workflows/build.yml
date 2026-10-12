@@ -59,6 +59,65 @@ jobs:
           path: csharp/dist/PdfToolkit.exe
           if-no-files-found: error
 
+  build-go:
+    name: Go (Win32 GUI) — Тесты и сборка PdfToolkit_Go.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: false
+
+      - name: Unpack Ghostscript for Go tests & embed bundle
+        shell: pwsh
+        run: |
+          $gsDir = Join-Path $env:RUNNER_TEMP "gs10051"
+          Expand-Archive -Path "csharp/PdfToolkit/Bundle/gs10051-win64.zip" -DestinationPath $gsDir -Force
+          $gsExe = Join-Path $gsDir "bin\gswin64c.exe"
+          if (-not (Test-Path $gsExe)) {
+            throw "gswin64c.exe not found after unpacking bundle"
+          }
+          echo "GS_PATH=$gsExe" >> $env:GITHUB_ENV
+          echo (Join-Path $gsDir "bin") >> $env:GITHUB_PATH
+
+          Copy-Item -Path "csharp/PdfToolkit/Bundle/gs10051-win64.zip" -Destination "go/internal/core/bundle/gs.zip" -Force
+
+      - name: Run Go Core Tests (real Ghostscript)
+        working-directory: go
+        shell: pwsh
+        run: |
+          go test -v ./internal/core/...
+
+      - name: Compile Windows Manifest & Build PdfToolkit_Go.exe
+        working-directory: go
+        shell: pwsh
+        run: |
+          if (Get-Command windres -ErrorAction SilentlyContinue) {
+            Push-Location cmd/pdftoolkit
+            windres -i app.rc -o rsrc_windows_amd64.syso
+            Pop-Location
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          go build -trimpath -ldflags="-s -w -H=windowsgui" -o "dist/PdfToolkit_Go.exe" ./cmd/pdftoolkit
+
+          $exe = Get-Item "dist/PdfToolkit_Go.exe"
+          Write-Host "Built PdfToolkit_Go.exe: $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Upload PdfToolkit_Go.exe (Go) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PdfToolkit-Go-win64
+          path: go/dist/PdfToolkit_Go.exe
+          if-no-files-found: error
+
   build-python:
     name: Python — Тесты и сборка PDF_Compressor.exe
     runs-on: windows-latest

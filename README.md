@@ -1,6 +1,9 @@
 # 📦 PDF Compressor — архиватор PDF для Windows
 
-> 🆕 **Версия 2.0** — теперь есть **объединение** и **разделение** PDF. Кроме того, добавлена версия на **C# (.NET 8)** без Python — см. папку `csharp/` и `csharp/README.md`. Ниже описана Python-версия (`pdf_compressor.py`).
+> 🆕 **Версия 2.0** — теперь есть **объединение** и **разделение** PDF. Доступны 3 реализации с графическим интерфейсом (GUI):
+> 1. **Python (`pdf_compressor.py`)** — описана ниже (`PDF_Compressor.exe`)
+> 2. **C# / .NET 8 (`csharp/`)** — WinForms со встроенным Ghostscript (`PdfToolkit.exe`, см. `csharp/README.md`)
+> 3. **Go (`go/`)** — нативный Win32 GUI со встроенным Ghostscript (`PdfToolkit_Go.exe`, см. `go/README.md`)
 
 Приложение с графическим интерфейсом для сжатия PDF файлов **в 2 и более раза**. Работает через **Ghostscript** — стандарт индустрии для обработки PDF.
 
