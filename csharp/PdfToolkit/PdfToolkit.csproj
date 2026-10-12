@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- Позволяет собрать WinForms-проект на Linux (для проверки компиляции); на Windows не влияет -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PdfToolkit</AssemblyName>
+    <RootNamespace>PdfToolkit</RootNamespace>
+    <Version>2.0.0</Version>
+    <Product>PDF Toolkit</Product>
+    <Description>Сжатие, объединение и разделение PDF через Ghostscript</Description>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <AssemblyTitle>PDF Toolkit</AssemblyTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Встроенный портативный Ghostscript 10.05.1 (см. Bundle/README.txt) -->
+    <EmbeddedResource Include="Bundle\gs10051-win64.zip" LogicalName="gs.zip" />
+  </ItemGroup>
+
+</Project>

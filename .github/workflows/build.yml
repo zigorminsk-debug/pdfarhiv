@@ -1,0 +1,111 @@
+name: Build & Test PDF Toolkit
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-csharp:
+    name: C# (.NET 8) — Тесты и сборка PdfToolkit.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Unpack bundled Ghostscript for tests
+        shell: pwsh
+        run: |
+          $gsDir = Join-Path $env:RUNNER_TEMP "gs10051"
+          Expand-Archive -Path "csharp/PdfToolkit/Bundle/gs10051-win64.zip" -DestinationPath $gsDir -Force
+          $gsExe = Join-Path $gsDir "bin\gswin64c.exe"
+          if (-not (Test-Path $gsExe)) {
+            throw "gswin64c.exe not found after unpacking bundle"
+          }
+          echo "GS_PATH=$gsExe" >> $env:GITHUB_ENV
+          echo (Join-Path $gsDir "bin") >> $env:GITHUB_PATH
+
+      - name: Run C# CoreTests (25 Ghostscript tests)
+        shell: pwsh
+        run: |
+          dotnet run --project csharp/tests/CoreTests/CoreTests.csproj -c Release -- "$env:GS_PATH"
+
+      - name: Publish single-file PdfToolkit.exe (win-x64, self-contained)
+        shell: pwsh
+        run: |
+          dotnet publish csharp/PdfToolkit/PdfToolkit.csproj -c Release -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=none `
+            -o csharp/dist
+
+          $exe = Get-Item "csharp/dist/PdfToolkit.exe"
+          Write-Host "Built PdfToolkit.exe: $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Upload PdfToolkit.exe (C#) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PdfToolkit-CSharp-win64
+          path: csharp/dist/PdfToolkit.exe
+          if-no-files-found: error
+
+  build-python:
+    name: Python — Тесты и сборка PDF_Compressor.exe
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Unpack Ghostscript for Python tests
+        shell: pwsh
+        run: |
+          $gsDir = Join-Path $env:RUNNER_TEMP "gs10051"
+          Expand-Archive -Path "csharp/PdfToolkit/Bundle/gs10051-win64.zip" -DestinationPath $gsDir -Force
+          $gsExe = Join-Path $gsDir "bin\gswin64c.exe"
+          echo "GS_PATH=$gsExe" >> $env:GITHUB_ENV
+          echo (Join-Path $gsDir "bin") >> $env:GITHUB_PATH
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller tkinterdnd2 pillow pypdf
+
+      - name: Run Python self-tests (tests/selftest.py)
+        shell: pwsh
+        run: |
+          python tests/selftest.py
+
+      - name: Build PDF_Compressor.exe via PyInstaller
+        shell: pwsh
+        run: |
+          python build_exe.py
+          $exe = Get-Item "dist/PDF_Compressor.exe"
+          Write-Host "Built PDF_Compressor.exe: $([math]::Round($exe.Length / 1MB, 2)) MB"
+
+      - name: Upload PDF_Compressor.exe (Python) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF_Compressor-Python-win64
+          path: dist/PDF_Compressor.exe
+          if-no-files-found: error
