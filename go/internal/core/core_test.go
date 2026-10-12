@@ -133,7 +133,7 @@ func TestGhostscriptOperations(t *testing.T) {
 
 	// 5. AutoCompress 2x
 	autoOut := filepath.Join(work, "auto.pdf")
-	autoSize, err := gs.AutoCompress(ctx, pdfA, autoOut, 2.0, t.Logf)
+	autoSize, err := gs.AutoCompress(ctx, pdfA, autoOut, 2.0, func(s string) { t.Log(s) })
 	if err != nil {
 		t.Fatalf("AutoCompress failed: %v", err)
 	}
