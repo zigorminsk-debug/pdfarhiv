@@ -121,12 +121,7 @@ def unique_path(path: Path) -> Path:
     return path.parent / f"{path.stem}_{os.getpid()}{path.suffix}"
 
 
-_PS_ESCAPE = str.maketrans({"\\": "\\\\", "(": "\\(", ")": "\\)"})
-
-
-def _ps_string(s: str) -> str:
-    """Экранирует путь для PostScript-строки."""
-    return "(" + str(s).translate(_PS_ESCAPE) + ")"
+_SUBPROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def gs_page_count(gs_path: str, pdf: Path) -> Optional[int]:
@@ -139,21 +134,25 @@ def gs_page_count(gs_path: str, pdf: Path) -> Optional[int]:
     except Exception:
         pass
 
-    ps = f"{_ps_string(pdf)} (r) file runpdfbegin pdfpagecount = quit"
-    for extra in ([f"--permit-file-read={pdf}"], ["-dNOSAFER"]):
-        try:
-            r = subprocess.run(
-                [gs_path, "-q", "-dNODISPLAY", *extra, "-c", ps],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="ignore", timeout=120,
-            )
-            m = re.search(r"^\s*(\d+)\s*$", r.stdout, re.MULTILINE)
-            if r.returncode == 0 and "error" not in r.stdout.lower() and m:
-                n = int(m.group(1))
-                if n > 0:
-                    return n
-        except Exception:
-            continue
+    try:
+        r = subprocess.run(
+            [
+                gs_path, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                "-sDEVICE=nullpage", "-dFirstPage=999999999", str(pdf),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="ignore", timeout=30,
+            creationflags=_SUBPROCESS_FLAGS,
+        )
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        m = re.search(r"Requested FirstPage is greater than the number of pages in the file:\s*(\d+)", combined)
+        if r.returncode == 0 and "error" not in combined.lower() and m:
+            n = int(m.group(1))
+            if n > 0:
+                return n
+    except Exception:
+        pass
     return None
 
 
@@ -196,10 +195,11 @@ def split_into_chunks(total: int, step: int) -> List[Tuple[int, int]]:
 # ===================== ОПЕРАЦИИ GHOSTSCRIPT (без потери качества) =====================
 
 def _run_gs(gs_path: str, args: List[str], timeout: int = 1800) -> subprocess.CompletedProcess:
-    cmd = [gs_path, "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
+    cmd = [gs_path, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
            "-dCompatibilityLevel=1.4", *args]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                       errors="ignore", timeout=timeout)
+    r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=timeout,
+                       creationflags=_SUBPROCESS_FLAGS)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()
         raise RuntimeError(f"Ghostscript вернул код {r.returncode}: {err[:400]}")
@@ -801,10 +801,12 @@ class PDFToolkitApp:
         self._log(f"   🎯 Цель: ≤ {format_size(target_size)} (сжатие ≥ x{target:g})")
 
         tmp = dst.with_suffix(".autotmp.pdf")
+        best_tmp = dst.with_suffix(".besttmp.pdf")
         best_size = 0
         best_profile: Optional[CompressionProfile] = None
+        order = [2, 4, 1] if target >= 2.0 else self.AUTO_ORDER
         try:
-            for idx in self.AUTO_ORDER:
+            for idx in order:
                 if self.stop_flag:
                     return 0
                 profile = PROFILES[idx]
@@ -816,27 +818,34 @@ class PDFToolkitApp:
                     continue
                 if size <= 0:
                     continue
-                if best_profile is None or size < best_size:
-                    best_size, best_profile = size, profile
                 if size <= target_size:
                     shutil.move(str(tmp), str(dst))
                     self._log(f"   ✔ Цель достигнута: {format_size(size)} (x{original_size / size:.1f}) "
                               f"профилем «{profile.name}»")
                     return size
+                if best_profile is None or size < best_size:
+                    best_size, best_profile = size, profile
+                    shutil.move(str(tmp), str(best_tmp))
+                elif tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
                 self._log(f"      Мало: {format_size(size)} (x{original_size / size:.1f}), агрессивнее...")
 
-            if best_profile is not None and best_size < original_size:
-                self._compress_single(src, dst, best_profile)
+            if best_profile is not None and best_size < original_size and best_tmp.exists():
+                shutil.move(str(best_tmp), str(dst))
                 self._log(f"   ⚠ Цель x{target:g} недостижима, лучшее — «{best_profile.name}»: "
                           f"{format_size(best_size)} (x{original_size / best_size:.1f})")
                 return best_size
             return 0
         finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+            for p_tmp in (tmp, best_tmp):
+                if p_tmp.exists():
+                    try:
+                        p_tmp.unlink()
+                    except OSError:
+                        pass
 
     def _compress_single(self, src: Path, dst: Path, profile: CompressionProfile) -> int:
         p = profile
@@ -848,9 +857,9 @@ class PDFToolkitApp:
             f"-dMonoImageResolution={p.dpi}",
             f"-dColorImageDownsampleType={p.image_downsample_type}",
             f"-dGrayImageDownsampleType={p.image_downsample_type}",
-            f"-dMonoImageDownsampleType={p.image_downsample_type}",
+            "-dMonoImageDownsampleType=/Subsample",
             f"-dJPEGQ={p.jpeg_quality}",
-            "-dAutoFilterColorImages=true", "-dAutoFilterGrayImages=true",
+            "-dAutoFilterColorImages=false", "-dAutoFilterGrayImages=false",
             "-dColorImageFilter=/DCTEncode", "-dGrayImageFilter=/DCTEncode",
             "-dDownsampleColorImages=true", "-dDownsampleGrayImages=true", "-dDownsampleMonoImages=true",
             *p.extra_args,
@@ -858,8 +867,9 @@ class PDFToolkitApp:
             str(src),
         ]
         try:
-            r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                               errors="ignore", timeout=300)
+            r = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               encoding="utf-8", errors="ignore", timeout=300,
+                               creationflags=_SUBPROCESS_FLAGS)
         except subprocess.TimeoutExpired:
             raise RuntimeError("Таймаут 5 мин — файл слишком большой или повреждён")
         except FileNotFoundError:

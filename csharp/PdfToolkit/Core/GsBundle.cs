@@ -12,6 +12,7 @@ public static class GsBundle
 {
     public const string GsVersion = "10.05.1";
     private const string GsResource = "gs.zip";
+    private const string MarkerName = ".complete_v2";
     /// <summary>Официальная ссылка Microsoft на VC++ Redistributable x64 (скачивается только при необходимости).</summary>
     public const string VcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 
@@ -20,47 +21,49 @@ public static class GsBundle
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                      "PdfToolkit", "gs-" + GsVersion);
 
+    private static readonly HashSet<string> NeededFiles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin/gswin64c.exe",
+        "bin/gsdll64.dll",
+        "COPYING.txt",
+    };
+
     /// <summary>
-    /// Распаковывает встроенный Ghostscript, если ещё не распакован. Возвращает путь к gswin64c.exe
-    /// или null, если архив не встроен. Повторные вызовы быстрые (проверяется маркер).
+    /// Распаковывает только необходимые файлы Ghostscript (gswin64c.exe, gsdll64.dll, COPYING.txt).
+    /// Все ресурсы (%rom%Resource, %rom%iccprofiles) уже встроены внутри gsdll64.dll,
+    /// поэтому распаковка 3 файлов вместо 535 занимает доли секунды и не вызывает зависания антивируса.
     /// </summary>
     public static string? EnsureExtracted()
     {
         string gsExe = Path.Combine(InstallRoot, "bin", "gswin64c.exe");
-        string marker = Path.Combine(InstallRoot, ".complete");
-        if (File.Exists(gsExe) && File.Exists(marker)) return gsExe;
+        string gsDll = Path.Combine(InstallRoot, "bin", "gsdll64.dll");
+        string marker = Path.Combine(InstallRoot, MarkerName);
+        if (File.Exists(gsExe) && File.Exists(gsDll) && File.Exists(marker))
+            return gsExe;
 
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(GsResource);
         if (stream is null) return null;
 
-        string parent = Path.GetDirectoryName(InstallRoot)!;
-        Directory.CreateDirectory(parent);
-        string tmp = InstallRoot + ".tmp";
-        if (Directory.Exists(tmp)) Directory.Delete(tmp, recursive: true);
-        Directory.CreateDirectory(tmp);
+        Directory.CreateDirectory(Path.Combine(InstallRoot, "bin"));
 
-        string tmpFull = Path.GetFullPath(tmp) + Path.DirectorySeparatorChar;
         using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
         {
             foreach (var entry in zip.Entries)
             {
-                string dest = Path.GetFullPath(Path.Combine(tmp, entry.FullName));
-                if (!dest.StartsWith(tmpFull, StringComparison.OrdinalIgnoreCase)) continue; // защита от zip-slip
-                if (string.IsNullOrEmpty(entry.Name))
-                {
-                    Directory.CreateDirectory(dest);
-                    continue;
-                }
+                string norm = entry.FullName.Replace('\\', '/');
+                if (!NeededFiles.Contains(norm)) continue;
+
+                string dest = Path.Combine(InstallRoot, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
                 Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                entry.ExtractToFile(dest, overwrite: true);
+                string tmpFile = dest + ".tmp";
+                entry.ExtractToFile(tmpFile, overwrite: true);
+                File.Move(tmpFile, dest, overwrite: true);
             }
         }
 
-        if (!File.Exists(Path.Combine(tmp, "bin", "gswin64c.exe")))
+        if (!File.Exists(gsExe))
             throw new IOException("В архиве нет bin\\gswin64c.exe — сборка повреждена");
 
-        if (Directory.Exists(InstallRoot)) Directory.Delete(InstallRoot, recursive: true);
-        Directory.Move(tmp, InstallRoot);
         File.WriteAllText(marker, GsVersion);
         return gsExe;
     }
@@ -75,7 +78,7 @@ public static class GsBundle
     }
 
     /// <summary>
-    /// Тихо ставит VC++ Redistributable (официальный установщик Microsoft, встроен в exe).
+    /// Тихо ставит VC++ Redistributable (официальный установщик Microsoft).
     /// Windows запросит подтверждение администратора (UAC). Возвращает true при успехе.
     /// </summary>
     public static async Task<bool> InstallVcRuntimeAsync()

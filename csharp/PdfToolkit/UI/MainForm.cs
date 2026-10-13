@@ -6,7 +6,7 @@ namespace PdfToolkit.UI;
 /// <summary>Главное окно: три вкладки — Сжать / Объединить / Разделить.</summary>
 public sealed class MainForm : Form
 {
-    private readonly GhostscriptService _gs = new();
+    private readonly GhostscriptService _gs = new(string.Empty);
     private bool _busy;
     private CancellationTokenSource? _cts;
 
@@ -66,15 +66,16 @@ public sealed class MainForm : Form
     /// <summary>Распаковка встроенного Ghostscript и, при необходимости, установка VC++.</summary>
     private async Task InitBundledAsync()
     {
-        SetBusy(true);
-        SetStatus("Подготовка встроенного Ghostscript (первый запуск — несколько секунд)...");
         try
         {
-            string? bundled = await Task.Run(GsBundle.EnsureExtracted);
+            string? bundled = await Task.Run(() =>
+            {
+                return GsBundle.EnsureExtracted() ?? GhostscriptService.FindGhostscript();
+            });
             if (bundled != null)
             {
                 _gs.GsPath = bundled;
-                Log("Встроенный Ghostscript готов: " + bundled);
+                Log("Ghostscript готов: " + bundled);
             }
         }
         catch (Exception ex)
@@ -103,7 +104,6 @@ public sealed class MainForm : Form
             }
         }
 
-        SetBusy(false);
         CheckGhostscript();
         SetStatus("Готов. Добавьте PDF и выберите операцию.");
     }
@@ -457,7 +457,7 @@ public sealed class MainForm : Form
         SetBusy(true);
         try
         {
-            await work(_cts.Token);
+            await Task.Run(() => work(_cts.Token), _cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -507,6 +507,19 @@ public sealed class MainForm : Form
             string dst = UniquePath(Path.Combine(dir, Path.GetFileNameWithoutExtension(src) + "_compressed.pdf"));
 
             Log($"▶ [{i + 1}/{files.Count}] {Path.GetFileName(src)} ({FormatSize(origSize)})");
+            int fileIdx = i;
+            int totalFiles = files.Count;
+            string shortName = Path.GetFileName(src);
+            _gs.OnProgress = (curPage, totalPages) =>
+            {
+                if (totalPages > 0)
+                {
+                    int filePct = curPage * 100 / totalPages;
+                    int overallPct = (fileIdx * 100 + filePct) / totalFiles;
+                    SetProgress(overallPct);
+                    SetStatus($"[{fileIdx + 1}/{totalFiles}] Сжатие: {shortName} — стр. {curPage} из {totalPages} ({filePct}%)");
+                }
+            };
             try
             {
                 long size = profile.Dpi == 0
@@ -534,6 +547,10 @@ public sealed class MainForm : Form
                 Log("   ❌ " + ex.Message);
                 skipped++;
             }
+            finally
+            {
+                _gs.OnProgress = null;
+            }
         }
         SetProgress(100);
 
@@ -543,7 +560,7 @@ public sealed class MainForm : Form
             SetStatus($"✅ Готово! Успешно: {ok}, пропущено: {skipped} | {FormatSize(totalOrig)} → {FormatSize(totalComp)} (-{pct:0.0}%)");
             Log($"📊 ИТОГО: успешно {ok}, пропущено {skipped}; было {FormatSize(totalOrig)} → стало {FormatSize(totalComp)} (-{pct:0.0}%)");
             if (ok > 0)
-                Invoke(() => MessageBox.Show(this,
+                BeginInvoke(() => MessageBox.Show(this,
                     $"Сжатие завершено!\n\nУспешно: {ok}\nПропущено: {skipped}\nБыло:  {FormatSize(totalOrig)}\nСтало: {FormatSize(totalComp)}\nЭкономия: {pct:0.0}%",
                     "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information));
         }
@@ -577,7 +594,7 @@ public sealed class MainForm : Form
             SetProgress(100);
             Log($"   ✅ Готово: {Path.GetFileName(output)} — {FormatSize(size)}, {(pages?.ToString() ?? "?")} стр.");
             SetStatus($"✅ Объединено: {Path.GetFileName(output)} ({FormatSize(size)})");
-            Invoke(() => MessageBox.Show(this,
+            BeginInvoke(() => MessageBox.Show(this,
                 $"Файлы объединены!\n\nРезультат: {Path.GetFileName(output)}\nРазмер: {FormatSize(size)}" +
                 (pages.HasValue ? $", страниц: {pages}" : "") + $"\nПапка: {Path.GetDirectoryName(output)}",
                 "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information));
@@ -660,12 +677,12 @@ public sealed class MainForm : Form
         if (okFiles == 0)
         {
             SetStatus("❌ Ничего не разделено — см. лог");
-            Invoke(() => MessageBox.Show(this, "Не удалось разделить файлы. Подробности в логе.", "Ошибка",
+            BeginInvoke(() => MessageBox.Show(this, "Не удалось разделить файлы. Подробности в логе.", "Ошибка",
                 MessageBoxButtons.OK, MessageBoxIcon.Error));
             return;
         }
         SetStatus($"✅ Готово: {created} файл(ов) из {okFiles} PDF");
-        Invoke(() => MessageBox.Show(this,
+        BeginInvoke(() => MessageBox.Show(this,
             $"Разделение завершено!\n\nСоздано файлов: {created}\nИз PDF: {okFiles} из {files.Count}\n\nПапка:\n{_splitOutDir ?? lastDir}",
             "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information));
     }

@@ -50,6 +50,7 @@ public sealed class GhostscriptService
     public static readonly int[] AutoOrder = { 3, 2, 4, 1 };
 
     public string? GsPath { get; set; }
+    public Action<int, int>? OnProgress { get; set; }
 
     public GhostscriptService(string? gsPath = null)
     {
@@ -100,6 +101,7 @@ public sealed class GhostscriptService
 
         var psi = new ProcessStartInfo(GsPath)
         {
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -110,14 +112,36 @@ public sealed class GhostscriptService
         foreach (var a in args) psi.ArgumentList.Add(a);
 
         using var proc = Process.Start(psi) ?? throw new GsException("Не удалось запустить Ghostscript");
-        var stdout = proc.StandardOutput.ReadToEndAsync();
-        var stderr = proc.StandardError.ReadToEndAsync();
+        // Закрываем stdin сразу, чтобы Ghostscript никогда не зависал в ожидании ввода в приглашении GS>
+        try { proc.StandardInput.Close(); } catch { /* ignore */ }
+
+        var outBuilder = new StringBuilder();
+        int totalPages = 0;
+        var stdoutTask = Task.Run(async () =>
+        {
+            while (await proc.StandardOutput.ReadLineAsync() is { } line)
+            {
+                outBuilder.AppendLine(line);
+                var mTot = Regex.Match(line, @"Processing pages \d+ through (\d+)");
+                if (mTot.Success && int.TryParse(mTot.Groups[1].Value, out int tot) && tot > 0)
+                {
+                    totalPages = tot;
+                }
+                else
+                {
+                    var mCur = Regex.Match(line.Trim(), @"^Page (\d+)$");
+                    if (mCur.Success && int.TryParse(mCur.Groups[1].Value, out int cur))
+                        OnProgress?.Invoke(cur, totalPages);
+                }
+            }
+        });
+        var stderrTask = proc.StandardError.ReadToEndAsync();
 
         using var timeout = new CancellationTokenSource(timeoutMs);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
         try
         {
-            await proc.WaitForExitAsync(linked.Token);
+            await proc.WaitForExitAsync(linked.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -126,8 +150,9 @@ public sealed class GhostscriptService
             throw new GsException("Таймаут — файл слишком большой или повреждён");
         }
 
-        string outText = await stdout;
-        string errText = await stderr;
+        await stdoutTask.ConfigureAwait(false);
+        string outText = outBuilder.ToString();
+        string errText = await stderrTask.ConfigureAwait(false);
         return (proc.ExitCode, outText, errText);
     }
 
@@ -137,27 +162,25 @@ public sealed class GhostscriptService
     /// <summary>Число страниц. Возвращает null, если файл не читается.</summary>
     public async Task<int?> PageCountAsync(string pdf, CancellationToken ct = default)
     {
-        // Ghostscript: сначала безопасный режим с разрешением чтения файла, затем -dNOSAFER.
-        string ps = $"({EscapePs(pdf)}) (r) file runpdfbegin pdfpagecount = quit";
-        foreach (var extra in new[] { $"--permit-file-read={pdf}", "-dNOSAFER" })
+        try
         {
-            try
+            var args = new[]
             {
-                var (code, stdout, _) = await RunAsync(new[] { "-q", "-dNODISPLAY", extra, "-c", ps }, 120_000, ct);
-                // Принимаем только строку, состоящую из одного числа (иначе это текст ошибки)
-                var m = Regex.Match(stdout, @"^\s*(\d+)\s*$", RegexOptions.Multiline);
-                // Ghostscript на битом файле печатает «Error:» и «0» с кодом 0 — это не валидный ответ
-                if (code == 0 && !stdout.Contains("Error", StringComparison.OrdinalIgnoreCase)
-                    && m.Success && int.TryParse(m.Groups[1].Value, out int n) && n > 0)
-                    return n;
-            }
-            catch (GsException) { /* пробуем следующий способ */ }
+                "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                "-sDEVICE=nullpage",
+                "-dFirstPage=999999999",
+                pdf,
+            };
+            var (code, stdout, stderr) = await RunAsync(args, 30_000, ct);
+            string combined = stdout + "\n" + stderr;
+            var m = Regex.Match(combined, @"Requested FirstPage is greater than the number of pages in the file:\s*(\d+)");
+            if (code == 0 && !combined.Contains("Error", StringComparison.OrdinalIgnoreCase)
+                && m.Success && int.TryParse(m.Groups[1].Value, out int n) && n > 0)
+                return n;
         }
+        catch (GsException) { /* файл не читается */ }
         return null;
     }
-
-    private static string EscapePs(string s) =>
-        s.Replace("\\", "\\\\").Replace("(", "\\(").Replace(")", "\\)");
 
     // ---------- операции без потери качества ----------
 
@@ -207,13 +230,13 @@ public sealed class GhostscriptService
         var args = new List<string>
         {
             "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-            "-dNOPAUSE", "-dQUIET", "-dBATCH", "-dSAFER",
+            "-dNOPAUSE", "-dBATCH", "-dSAFER",
             $"-dColorImageResolution={p.Dpi}", $"-dGrayImageResolution={p.Dpi}", $"-dMonoImageResolution={p.Dpi}",
             $"-dColorImageDownsampleType={p.DownsampleType}",
             $"-dGrayImageDownsampleType={p.DownsampleType}",
-            $"-dMonoImageDownsampleType={p.DownsampleType}",
+            "-dMonoImageDownsampleType=/Subsample",
             $"-dJPEGQ={p.JpegQuality}",
-            "-dAutoFilterColorImages=true", "-dAutoFilterGrayImages=true",
+            "-dAutoFilterColorImages=false", "-dAutoFilterGrayImages=false",
             "-dColorImageFilter=/DCTEncode", "-dGrayImageFilter=/DCTEncode",
             "-dDownsampleColorImages=true", "-dDownsampleGrayImages=true", "-dDownsampleMonoImages=true",
         };
@@ -221,14 +244,13 @@ public sealed class GhostscriptService
         args.Add($"-sOutputFile={dst}");
         args.Add(src);
 
-        await RunChecked(args, dst, ct);
+        await RunChecked(args, dst, ct).ConfigureAwait(false);
         return new FileInfo(dst).Length;
     }
 
     /// <summary>
     /// АВТО-режим: перебирает профили от мягкого к агрессивному и берёт первый, который даёт
-    /// сжатие не меньше targetRatio. Если цель недостижима — лучший результат.
-    /// Возвращает размер итогового файла в dst; 0 — если ничего не вышло (dst не создан).
+    /// сжатие не меньше targetRatio. Если цель недостижима — сохраняет лучший промежуточный файл без повторного запуска.
     /// </summary>
     public async Task<long> AutoCompressAsync(string src, string dst, double targetRatio,
         Action<string>? log = null, CancellationToken ct = default)
@@ -237,12 +259,14 @@ public sealed class GhostscriptService
         long originalSize = new FileInfo(src).Length;
         long targetSize = (long)(originalSize / Math.Max(1.05, targetRatio));
         string tmp = Path.ChangeExtension(dst, ".autotmp.pdf");
+        string bestTmp = Path.ChangeExtension(dst, ".besttmp.pdf");
 
+        int[] order = targetRatio >= 2.0 ? new[] { 2, 4, 1 } : AutoOrder;
         long bestSize = 0;
         CompressionProfile? best = null;
         try
         {
-            foreach (int idx in AutoOrder)
+            foreach (int idx in order)
             {
                 ct.ThrowIfCancellationRequested();
                 var p = Profiles[idx];
@@ -250,7 +274,7 @@ public sealed class GhostscriptService
                 long size;
                 try
                 {
-                    size = await CompressAsync(src, tmp, p, ct);
+                    size = await CompressAsync(src, tmp, p, ct).ConfigureAwait(false);
                 }
                 catch (GsException e)
                 {
@@ -260,23 +284,29 @@ public sealed class GhostscriptService
 
                 if (size <= 0) continue;
 
-                if (best == null || size < bestSize)
-                {
-                    bestSize = size;
-                    best = p;
-                }
                 if (size <= targetSize)
                 {
                     File.Move(tmp, dst, overwrite: true);
                     log($"   ✔ Цель достигнута: {size:N0} Б (x{(double)originalSize / size:0.0}) — «{p.Name}»");
                     return size;
                 }
+
+                if (best == null || size < bestSize)
+                {
+                    bestSize = size;
+                    best = p;
+                    File.Move(tmp, bestTmp, overwrite: true);
+                }
+                else
+                {
+                    try { File.Delete(tmp); } catch { /* ignore */ }
+                }
                 log($"      Мало: x{(double)originalSize / size:0.0}, агрессивнее...");
             }
 
-            if (best != null && bestSize < originalSize)
+            if (best != null && bestSize < originalSize && File.Exists(bestTmp))
             {
-                await CompressAsync(src, dst, best, ct);
+                File.Move(bestTmp, dst, overwrite: true);
                 log($"   ⚠ Цель x{targetRatio:0.#} недостижима, лучшее — «{best.Name}» (x{(double)originalSize / bestSize:0.0})");
                 return bestSize;
             }
@@ -285,6 +315,7 @@ public sealed class GhostscriptService
         finally
         {
             try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+            try { if (File.Exists(bestTmp)) File.Delete(bestTmp); } catch { /* ignore */ }
         }
     }
 }

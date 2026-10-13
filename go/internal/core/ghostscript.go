@@ -1,10 +1,12 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,7 +83,8 @@ var AutoOrder = []int{3, 2, 4, 1}
 
 // GhostscriptService — обёртка над Ghostscript для сжатия, объединения и разделения PDF.
 type GhostscriptService struct {
-	GsPath string
+	GsPath     string
+	OnProgress func(currentPage, totalPages int)
 }
 
 // NewGhostscriptService создаёт сервис с указанным или автоматически найденным Ghostscript.
@@ -151,6 +155,11 @@ func FindGhostscript() string {
 	return ""
 }
 
+var (
+	reTotalPages = regexp.MustCompile(`Processing pages \d+ through (\d+)`)
+	reCurPage    = regexp.MustCompile(`^Page (\d+)\s*$`)
+)
+
 func (s *GhostscriptService) run(ctx context.Context, args []string, timeout time.Duration) (int, string, string, error) {
 	if s.GsPath == "" {
 		return -1, "", "", fmt.Errorf("Ghostscript не найден. Укажите путь к gswin64c.exe")
@@ -164,12 +173,45 @@ func (s *GhostscriptService) run(ctx context.Context, args []string, timeout tim
 
 	cmd := exec.CommandContext(runCtx, s.GsPath, args...)
 	configureCmd(cmd)
+	cmd.WaitDelay = 3 * time.Second
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	// Всегда закрытый stdin, чтобы Ghostscript никогда не зависал в ожидании ввода в приглашении GS>
+	cmd.Stdin = bytes.NewReader(nil)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return -1, "", "", err
+	}
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return -1, "", "", err
+	}
+
+	var stdout bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		totalPages := 0
+		scanner := bufio.NewScanner(io.TeeReader(stdoutPipe, &stdout))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if m := reTotalPages.FindStringSubmatch(line); len(m) == 2 {
+				if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+					totalPages = n
+				}
+			} else if m := reCurPage.FindStringSubmatch(line); len(m) == 2 {
+				if p, err := strconv.Atoi(m[1]); err == nil && s.OnProgress != nil {
+					s.OnProgress(p, totalPages)
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return -1, stdout.String(), stderr.String(), ctx.Err()
 	}
@@ -197,32 +239,26 @@ func shortStr(s string, max int) string {
 	return string(runes[:max])
 }
 
-func escapePs(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `(`, `\(`)
-	s = strings.ReplaceAll(s, `)`, `\)`)
-	return s
-}
-
-var pageCountRegex = regexp.MustCompile(`(?m)^\s*(\d+)\s*$`)
+var firstPageCountRegex = regexp.MustCompile(`Requested FirstPage is greater than the number of pages in the file:\s*(\d+)`)
 
 // PageCount возвращает число страниц в PDF (и true) либо (0, false), если файл повреждён.
 func (s *GhostscriptService) PageCount(ctx context.Context, pdf string) (int, bool) {
-	ps := fmt.Sprintf("(%s) (r) file runpdfbegin pdfpagecount = quit", escapePs(pdf))
-	for _, extra := range []string{"--permit-file-read=" + pdf, "-dNOSAFER"} {
-		code, stdout, _, err := s.run(ctx, []string{"-q", "-dNODISPLAY", extra, "-c", ps}, 2*time.Minute)
-		if err != nil {
-			if ctx.Err() != nil {
-				return 0, false
-			}
-			continue
-		}
-		if code == 0 && !strings.Contains(strings.ToLower(stdout), "error") {
-			m := pageCountRegex.FindStringSubmatch(stdout)
-			if len(m) == 2 {
-				if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-					return n, true
-				}
+	args := []string{
+		"-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+		"-sDEVICE=nullpage",
+		"-dFirstPage=999999999",
+		pdf,
+	}
+	code, stdout, stderr, err := s.run(ctx, args, 30*time.Second)
+	if err != nil {
+		return 0, false
+	}
+	combined := stdout + "\n" + stderr
+	if code == 0 && !strings.Contains(strings.ToLower(combined), "error") {
+		m := firstPageCountRegex.FindStringSubmatch(combined)
+		if len(m) == 2 {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+				return n, true
 			}
 		}
 	}
@@ -253,7 +289,7 @@ func (s *GhostscriptService) Merge(ctx context.Context, inputs []string, output 
 		return fmt.Errorf("Для объединения нужно минимум 2 файла")
 	}
 	args := []string{
-		"-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+		"-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
 		"-dPassThroughJPEGImages=true", "-dPassThroughJPXImages=true", "-dDetectDuplicateImages=true",
 		"-sOutputFile=" + output,
 	}
@@ -264,7 +300,7 @@ func (s *GhostscriptService) Merge(ctx context.Context, inputs []string, output 
 // Extract извлекает диапазон страниц r.First..r.Last (включительно) без потери качества.
 func (s *GhostscriptService) Extract(ctx context.Context, src string, r PageRange, output string) error {
 	args := []string{
-		"-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+		"-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
 		fmt.Sprintf("-dFirstPage=%d", r.First),
 		fmt.Sprintf("-dLastPage=%d", r.Last),
 		"-dPassThroughJPEGImages=true", "-dPassThroughJPXImages=true",
@@ -278,15 +314,15 @@ func (s *GhostscriptService) Extract(ctx context.Context, src string, r PageRang
 func (s *GhostscriptService) Compress(ctx context.Context, src, dst string, p CompressionProfile) (int64, error) {
 	args := []string{
 		"-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-		"-dNOPAUSE", "-dQUIET", "-dBATCH", "-dSAFER",
+		"-dNOPAUSE", "-dBATCH", "-dSAFER",
 		fmt.Sprintf("-dColorImageResolution=%d", p.Dpi),
 		fmt.Sprintf("-dGrayImageResolution=%d", p.Dpi),
 		fmt.Sprintf("-dMonoImageResolution=%d", p.Dpi),
 		fmt.Sprintf("-dColorImageDownsampleType=%s", p.DownsampleType),
 		fmt.Sprintf("-dGrayImageDownsampleType=%s", p.DownsampleType),
-		fmt.Sprintf("-dMonoImageDownsampleType=%s", p.DownsampleType),
+		"-dMonoImageDownsampleType=/Subsample",
 		fmt.Sprintf("-dJPEGQ=%d", p.JpegQuality),
-		"-dAutoFilterColorImages=true", "-dAutoFilterGrayImages=true",
+		"-dAutoFilterColorImages=false", "-dAutoFilterGrayImages=false",
 		"-dColorImageFilter=/DCTEncode", "-dGrayImageFilter=/DCTEncode",
 		"-dDownsampleColorImages=true", "-dDownsampleGrayImages=true", "-dDownsampleMonoImages=true",
 	}
@@ -304,6 +340,7 @@ func (s *GhostscriptService) Compress(ctx context.Context, src, dst string, p Co
 }
 
 // AutoCompress перебирает профили от мягкого к агрессивному до достижения targetRatio.
+// Сохраняет лучший промежуточный файл (.besttmp.pdf), чтобы никогда не запускать Ghostscript повторно впустую.
 func (s *GhostscriptService) AutoCompress(ctx context.Context, src, dst string, targetRatio float64, logFn func(string)) (int64, error) {
 	if logFn == nil {
 		logFn = func(string) {}
@@ -318,15 +355,25 @@ func (s *GhostscriptService) AutoCompress(ctx context.Context, src, dst string, 
 	}
 	targetSize := int64(float64(originalSize) / targetRatio)
 	ext := filepath.Ext(dst)
-	tmp := strings.TrimSuffix(dst, ext) + ".autotmp.pdf"
+	stem := strings.TrimSuffix(dst, ext)
+	tmp := stem + ".autotmp.pdf"
+	bestTmp := stem + ".besttmp.pdf"
 	defer func() {
 		_ = os.Remove(tmp)
+		_ = os.Remove(bestTmp)
 	}()
 
 	var bestSize int64
 	var bestProfile *CompressionProfile
 
-	for _, idx := range AutoOrder {
+	order := AutoOrder
+	if targetRatio >= 2.0 {
+		// При цели ≥ 2x профиль 300 DPI почти никогда не даёт двукратного сжатия,
+		// поэтому начинаем сразу со 150 DPI («Баланс»), экономя самый долгий прогон.
+		order = []int{2, 4, 1}
+	}
+
+	for _, idx := range order {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
@@ -343,11 +390,6 @@ func (s *GhostscriptService) AutoCompress(ctx context.Context, src, dst string, 
 		if size <= 0 {
 			continue
 		}
-		if bestProfile == nil || size < bestSize {
-			bestSize = size
-			pCopy := p
-			bestProfile = &pCopy
-		}
 		if size <= targetSize {
 			_ = os.Remove(dst)
 			if err := os.Rename(tmp, dst); err != nil {
@@ -357,11 +399,21 @@ func (s *GhostscriptService) AutoCompress(ctx context.Context, src, dst string, 
 				FormatSize(size), float64(originalSize)/float64(size), p.Name))
 			return size, nil
 		}
+		if bestProfile == nil || size < bestSize {
+			bestSize = size
+			pCopy := p
+			bestProfile = &pCopy
+			_ = os.Remove(bestTmp)
+			_ = os.Rename(tmp, bestTmp)
+		} else {
+			_ = os.Remove(tmp)
+		}
 		logFn(fmt.Sprintf("      Мало: x%.1f, агрессивнее...", float64(originalSize)/float64(size)))
 	}
 
 	if bestProfile != nil && bestSize < originalSize {
-		if _, err := s.Compress(ctx, src, dst, *bestProfile); err != nil {
+		_ = os.Remove(dst)
+		if err := os.Rename(bestTmp, dst); err != nil {
 			return 0, err
 		}
 		logFn(fmt.Sprintf("   ⚠ Цель x%.1f недостижима, лучшее — «%s» (x%.1f)",

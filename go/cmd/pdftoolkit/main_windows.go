@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -298,6 +299,7 @@ type App struct {
 
 	uiMu      sync.Mutex
 	uiQueue   []func()
+	uiPending bool
 
 	// Common controls
 	lblGsStatus uintptr
@@ -360,10 +362,12 @@ func makeFont(height int32, weight int32, face string) uintptr {
 }
 
 func (a *App) createCtrl(exStyle uint32, className, text string, style uint32, x, y, w, h int32, id uintptr, font uintptr) uintptr {
+	clsPtr := u16(className)
+	txtPtr := u16(text)
 	hwnd, _, _ := procCreateWindowExW.Call(
 		uintptr(exStyle),
-		uintptr(unsafe.Pointer(u16(className))),
-		uintptr(unsafe.Pointer(u16(text))),
+		uintptr(unsafe.Pointer(clsPtr)),
+		uintptr(unsafe.Pointer(txtPtr)),
 		uintptr(style|wsChild),
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		a.hwnd,
@@ -371,6 +375,8 @@ func (a *App) createCtrl(exStyle uint32, className, text string, style uint32, x
 		a.hInstance,
 		0,
 	)
+	runtime.KeepAlive(clsPtr)
+	runtime.KeepAlive(txtPtr)
 	if font == 0 {
 		font = a.fontUI
 	}
@@ -397,23 +403,31 @@ func getText(hwnd uintptr) string {
 func (a *App) postUI(fn func()) {
 	a.uiMu.Lock()
 	a.uiQueue = append(a.uiQueue, fn)
+	needPost := !a.uiPending
+	a.uiPending = true
 	a.uiMu.Unlock()
-	procPostMessageW.Call(a.hwnd, wmAppRunUI, 0, 0)
+	if needPost && a.hwnd != 0 {
+		procPostMessageW.Call(a.hwnd, wmAppRunUI, 0, 0)
+	}
 }
 
 func (a *App) drainUI() {
-	for {
-		a.uiMu.Lock()
-		if len(a.uiQueue) == 0 {
-			a.uiMu.Unlock()
-			return
-		}
-		batch := a.uiQueue
-		a.uiQueue = nil
+	a.uiMu.Lock()
+	if len(a.uiQueue) == 0 {
+		a.uiPending = false
 		a.uiMu.Unlock()
-		for _, fn := range batch {
-			fn()
-		}
+		return
+	}
+	fn := a.uiQueue[0]
+	a.uiQueue = a.uiQueue[1:]
+	hasMore := len(a.uiQueue) > 0
+	a.uiPending = hasMore
+	a.uiMu.Unlock()
+
+	fn()
+
+	if hasMore && a.hwnd != 0 {
+		procPostMessageW.Call(a.hwnd, wmAppRunUI, 0, 0)
 	}
 }
 
@@ -475,8 +489,8 @@ func (a *App) buildUI() {
 	a.btnGsManual = a.createCtrl(0, "BUTTON", "🔍 Указать вручную", wsVisible|wsTabStop|bsPushButton, 650, 8, 155, 28, idGsManual, a.fontUI)
 	a.btnGsDl = a.createCtrl(0, "BUTTON", "📥 Скачать Ghostscript", wsVisible|wsTabStop|bsPushButton, 812, 8, 160, 28, idGsDownload, a.fontUI)
 
-	// Tab control
-	a.tabCtrl = a.createCtrl(0, "SysTabControl32", "", wsVisible|wsTabStop|wsClipChildren, 12, 42, 960, 445, idTabs, a.fontBold)
+	// Tab control (только шапка вкладок высотой 30px, чтобы не перекрывать дочерние кнопки и списки)
+	a.tabCtrl = a.createCtrl(0, "SysTabControl32", "", wsVisible|wsTabStop, 12, 42, 960, 30, idTabs, a.fontBold)
 	for i, title := range []string{" 🗜 Сжать ", " 🔗 Объединить ", " ✂ Разделить "} {
 		item := tcItemW{
 			mask:    tcifText,
@@ -605,10 +619,6 @@ func (a *App) switchTab(tab int) {
 
 func (a *App) initBundledAsync() {
 	go func() {
-		a.postUI(func() {
-			a.setBusy(true)
-			setText(a.lblStatus, "Подготовка встроенного Ghostscript (первый запуск — несколько секунд)...")
-		})
 		bundled, err := core.EnsureExtracted()
 		if err != nil {
 			a.log("⚠ Не удалось распаковать встроенный Ghostscript: " + err.Error())
@@ -620,7 +630,6 @@ func (a *App) initBundledAsync() {
 			a.gs.GsPath = core.FindGhostscript()
 		}
 		a.postUI(func() {
-			a.setBusy(false)
 			a.checkGhostscript()
 			setText(a.lblStatus, "Готов. Добавьте PDF и выберите операцию.")
 		})
@@ -972,6 +981,19 @@ func (a *App) startCompress() {
 
 			a.log(fmt.Sprintf("▶ [%d/%d] %s (%s)", i+1, len(files), filepath.Base(src), core.FormatSize(origSize)))
 
+			fileIdx := i
+			totalFiles := len(files)
+			fileName := filepath.Base(src)
+			a.gs.OnProgress = func(curPage, totalPages int) {
+				if totalPages > 0 {
+					filePct := curPage * 100 / totalPages
+					overallPct := (fileIdx*100 + filePct) / totalFiles
+					a.setProgress(overallPct)
+					a.setStatus(fmt.Sprintf("[%d/%d] Сжатие: %s — стр. %d из %d (%d%%)",
+						fileIdx+1, totalFiles, fileName, curPage, totalPages, filePct))
+				}
+			}
+
 			var size int64
 			var compErr error
 			if profile.Dpi == 0 {
@@ -979,6 +1001,7 @@ func (a *App) startCompress() {
 			} else {
 				size, compErr = a.gs.Compress(ctx, src, dst, profile)
 			}
+			a.gs.OnProgress = nil
 			if ctx.Err() != nil {
 				_ = os.Remove(dst)
 				a.log("⏹ Сжатие остановлено.")
@@ -1268,9 +1291,24 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		id := int(wParam & 0xFFFF)
 		code := int((wParam >> 16) & 0xFFFF)
 
+		if id == idCompProfile {
+			if code == cbnSelChange {
+				idx, _, _ := procSendMessageW.Call(a.cbProfile, cbGetCurSel, 0, 0)
+				if int(idx) >= 0 && int(idx) < len(core.Profiles) {
+					setText(a.lblProfDesc, core.Profiles[idx].Description)
+				}
+			}
+			return 0
+		}
+
+		// Для кнопок обрабатываем только BN_CLICKED (code == 0)
+		if code != 0 {
+			break
+		}
+
 		switch id {
 		case idGsManual:
-			a.selectGsDialog()
+			a.postUI(a.selectGsDialog)
 		case idGsDownload:
 			procShellExecuteW.Call(0, uintptr(unsafe.Pointer(u16("open"))), uintptr(unsafe.Pointer(u16("https://ghostscript.com/releases/gsdnld.html"))), 0, 0, swShow)
 		case idStop:
@@ -1278,29 +1316,26 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 
 		// Compress tab
 		case idCompAddFiles:
-			a.openPdfDialog(0)
+			a.postUI(func() { a.openPdfDialog(0) })
 		case idCompAddFolder:
-			if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
-				addFolderRecursive(&a.compFiles, dir)
-				a.refreshList(0)
-			}
+			a.postUI(func() {
+				if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
+					addFolderRecursive(&a.compFiles, dir)
+					a.refreshList(0)
+				}
+			})
 		case idCompRemove:
 			a.removeSelected(0)
 		case idCompClear:
 			a.compFiles = nil
 			a.refreshList(0)
-		case idCompProfile:
-			if code == cbnSelChange {
-				idx, _, _ := procSendMessageW.Call(a.cbProfile, cbGetCurSel, 0, 0)
-				if int(idx) >= 0 && int(idx) < len(core.Profiles) {
-					setText(a.lblProfDesc, core.Profiles[idx].Description)
-				}
-			}
 		case idCompPickOut:
-			if dir := a.browseFolderDialog("Папка для сжатых файлов"); dir != "" {
-				a.compOutDir = dir
-				setText(a.edCompOut, dir)
-			}
+			a.postUI(func() {
+				if dir := a.browseFolderDialog("Папка для сжатых файлов"); dir != "" {
+					a.compOutDir = dir
+					setText(a.edCompOut, dir)
+				}
+			})
 		case idCompResetOut:
 			a.compOutDir = ""
 			setText(a.edCompOut, "[Рядом с оригиналом, суффикс _compressed]")
@@ -1309,12 +1344,14 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 
 		// Merge tab
 		case idMergeAddFiles:
-			a.openPdfDialog(1)
+			a.postUI(func() { a.openPdfDialog(1) })
 		case idMergeAddFolder:
-			if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
-				addFolderRecursive(&a.mergeFiles, dir)
-				a.refreshList(1)
-			}
+			a.postUI(func() {
+				if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
+					addFolderRecursive(&a.mergeFiles, dir)
+					a.refreshList(1)
+				}
+			})
 		case idMergeUp:
 			a.moveMergeSelected(-1)
 		case idMergeDown:
@@ -1325,30 +1362,36 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			a.mergeFiles = nil
 			a.refreshList(1)
 		case idMergeSaveAs:
-			if out := a.savePdfDialog(); out != "" {
-				setText(a.edMergeOut, out)
-			}
+			a.postUI(func() {
+				if out := a.savePdfDialog(); out != "" {
+					setText(a.edMergeOut, out)
+				}
+			})
 		case idMergeStart:
 			a.startMerge()
 
 		// Split tab
 		case idSplitAddFiles:
-			a.openPdfDialog(2)
+			a.postUI(func() { a.openPdfDialog(2) })
 		case idSplitAddFolder:
-			if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
-				addFolderRecursive(&a.splitFiles, dir)
-				a.refreshList(2)
-			}
+			a.postUI(func() {
+				if dir := a.browseFolderDialog("Выберите папку с PDF"); dir != "" {
+					addFolderRecursive(&a.splitFiles, dir)
+					a.refreshList(2)
+				}
+			})
 		case idSplitRemove:
 			a.removeSelected(2)
 		case idSplitClear:
 			a.splitFiles = nil
 			a.refreshList(2)
 		case idSplitPickOut:
-			if dir := a.browseFolderDialog("Папка для разделённых файлов"); dir != "" {
-				a.splitOutDir = dir
-				setText(a.edSplitOut, dir)
-			}
+			a.postUI(func() {
+				if dir := a.browseFolderDialog("Папка для разделённых файлов"); dir != "" {
+					a.splitOutDir = dir
+					setText(a.edSplitOut, dir)
+				}
+			})
 		case idSplitResetOut:
 			a.splitOutDir = ""
 			setText(a.edSplitOut, "[Подпапка «<имя>_pages» рядом с файлом]")
@@ -1376,7 +1419,13 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	return ret
 }
 
+var wndProcCallback = syscall.NewCallback(wndProc)
+
 func main() {
+	// КРИТИЧНО для Win32 GUI в Go: закрепляем главную горутину за текущим потоком ОС,
+	// иначе планировщик Go перенесёт цикл GetMessageW на другой поток и окно зависнет ("Не отвечает").
+	runtime.LockOSThread()
+
 	procCoInitializeEx.Call(0, 2) // COINIT_APARTMENTTHREADED
 
 	icc := initCommonControlsEx{
@@ -1392,7 +1441,7 @@ func main() {
 	className := u16("PdfToolkitGoMainWindow")
 	wc := wndClassExW{
 		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
-		lpfnWndProc:   syscall.NewCallback(wndProc),
+		lpfnWndProc:   wndProcCallback,
 		hInstance:     hInst,
 		hIcon:         icon,
 		hCursor:       cursor,
@@ -1407,7 +1456,7 @@ func main() {
 		fontUI:    makeFont(-15, 400, "Segoe UI"),
 		fontBold:  makeFont(-15, 700, "Segoe UI"),
 		fontMono:  makeFont(-14, 400, "Consolas"),
-		gs:        core.NewGhostscriptService(""),
+		gs:        &core.GhostscriptService{},
 	}
 	globalApp = app
 
